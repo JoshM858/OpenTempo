@@ -49,22 +49,22 @@ It then launches fullscreen like a native app and loads offline after the first 
 Browsers can't do some things the native app does: no haptics, no frame thumbnails on swing cards, and the
 Export button uses the browser share sheet where available. Audio starts after the first tap (browser rule).
 
-## Deploy to Cloudflare Pages
+## Deploy to Cloudflare (Workers static assets)
 
-Config lives in `wrangler.toml` and `public/_headers` (cache rules; the `/*` SPA fallback is in `public/_redirects`).
+Config lives in `wrangler.toml` (serves `dist/` with an SPA fallback) and `public/_headers` (cache rules).
 
-**Option A - Git integration (no tokens needed):** Cloudflare dashboard -> Workers & Pages -> Create -> Pages ->
-Connect to Git -> pick this repo. Build command `pnpm install && pnpm run build`, output directory `dist`,
-environment variables `NODE_VERSION=22` and `EXPO_PUBLIC_API_URL=<your API url>`. Every push redeploys.
+**Git integration (no tokens needed):** Cloudflare dashboard -> Workers & Pages -> Create -> Import a repository ->
+pick this repo (branch `main`, or the branch you want live). Build command `pnpm install && pnpm run build`,
+deploy command `npx wrangler deploy`, build variables `NODE_VERSION=22` and `EXPO_PUBLIC_API_URL=<your API url>`.
+Every push redeploys.
 
-**Option B - CLI:** set `CLOUDFLARE_API_TOKEN` (Pages: Edit permission) and `CLOUDFLARE_ACCOUNT_ID`, then
+**CLI:** set `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, then
 `EXPO_PUBLIC_API_URL=<your API url> pnpm run deploy`.
 
 ### Custom domain (548987.xyz)
 
-After the first deploy: Workers & Pages -> opentempo -> Custom domains -> Set up a custom domain -> `548987.xyz`
-(or a subdomain such as `tempo.548987.xyz`). If the domain's DNS is on Cloudflare the records are created
-automatically; otherwise add the CNAME to `opentempo.pages.dev` that Cloudflare shows you (a subdomain is
-easiest in that case, since apex CNAMEs need Cloudflare DNS). HTTPS is issued automatically, which is what
-Add to Home Screen needs. Delete any home-screen icon made from the `pages.dev` address and re-add it from
-the final domain, because the installed app is tied to the address it was installed from.
+After the first deploy: Workers & Pages -> opentempo -> Settings -> Domains & Routes -> Add -> Custom domain ->
+`548987.xyz` (or a subdomain such as `tempo.548987.xyz`). The domain's DNS must be on Cloudflare for this; the
+record is created for you. HTTPS is issued automatically, which Add to Home Screen needs. Delete any home-screen
+icon made from the `workers.dev` address and re-add it from the final domain, because the installed app is tied
+to the address it was installed from.

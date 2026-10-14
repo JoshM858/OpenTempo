@@ -1,3 +1,8 @@
 name = "opentempo"
 compatibility_date = "2026-10-01"
-pages_build_output_dir = "dist"
+
+# Static site: no Worker code, just serve the Expo web export in dist/.
+[assets]
+directory = "./dist"
+# Unknown paths (deep links / refreshes) get index.html so the SPA router handles them.
+not_found_handling = "single-page-application"

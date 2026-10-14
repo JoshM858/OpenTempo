@@ -9,7 +9,7 @@
     "serve": "node scripts/serve.mjs",
     "icons": "node scripts/make-icons.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "deploy": "pnpm run build && wrangler pages deploy"
+    "deploy": "pnpm run build && wrangler deploy"
   },
   "dependencies": {
     "@expo-google-fonts/inter": "^0.4.0",
