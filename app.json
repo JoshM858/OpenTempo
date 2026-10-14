@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "3to1 Golf",
+    "slug": "opentempo",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/images/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#000000"
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/images/icon.png",
+      "name": "3to1 Golf",
+      "shortName": "3to1 Golf",
+      "backgroundColor": "#000000",
+      "themeColor": "#000000"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font"
+    ],
+    "experiments": {
+      "reactCompiler": true
+    }
+  }
+}

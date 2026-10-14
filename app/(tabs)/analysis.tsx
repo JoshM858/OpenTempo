@@ -1,0 +1,1422 @@
+import { Feather, MaterialCommunityIcons } from "@expo/vector-icons";
+import { Video, ResizeMode } from "expo-av";
+import type { AVPlaybackStatus } from "expo-av";
+import * as Haptics from "expo-haptics";
+import * as ImagePicker from "expo-image-picker";
+import * as Sharing from "expo-sharing";
+import React, { useEffect, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Alert,
+  Animated,
+  Image,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Switch,
+  Text,
+  TextInput,
+  useWindowDimensions,
+  View,
+} from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { useTempo } from "@/context/TempoContext";
+import {
+  EMPTY_MARKERS,
+  useSwingLibrary,
+  type Markers,
+  type Swing,
+} from "@/context/SwingLibraryContext";
+import { CATEGORY_LABELS, type ShotCategory } from "@/data/tempoPlayers";
+import { playImpact, playStart, playTop, preloadSounds, stopAllAudio } from "@/utils/audio";
+import { hapticImpact, hapticTakeaway, hapticTop } from "@/utils/haptics";
+import { useActiveTimeTracker } from "@/hooks/useActiveTimeTracker";
+import { incrementSwingsAnalyzed } from "@/utils/sessions";
+import { computeSwingAnalysis } from "@/utils/swingAnalysis";
+import { addSwingRecord } from "@/utils/swingHistory";
+import { generateThumbnail } from "@/utils/thumbnails";
+import { canPickVideos } from "@/utils/mediaAccess";
+
+const FPS = 30;
+const MS_PER_FRAME = 1000 / FPS;
+const LONG_GAME_RATIO = 3.0;
+const SHORT_GAME_RATIO = 2.0;
+const BLUE = "#1A8CFF";
+const RED = "#FF3B30";
+const ORANGE = "#FF9F0A";
+const CLUB_TAGS: ShotCategory[] = ["tee", "approach", "shortgame", "putting"];
+/** How close to the impact marker (ms of video time) triggers the slow-motion zoom. */
+const IMPACT_ZOOM_WINDOW_MS = 350;
+const IMPACT_ZOOM_SCALE = 1.35;
+/** How long the slow-motion pass freezes on each marker frame before resuming. */
+const MARKER_PAUSE_MS = 500;
+
+const PHASE_WORDS: Record<"takeaway" | "top" | "impact", string> = {
+  takeaway: "TAKEAWAY",
+  top: "TOP",
+  impact: "IMPACT",
+};
+
+interface PreviewState {
+  active: boolean;
+  pass: 0 | 1 | 2 | 3;
+  fired: Set<string>;
+  transitioning: boolean;
+}
+
+function toTitleCase(text: string): string {
+  return text.replace(/\w\S*/g, (word) => word[0].toUpperCase() + word.slice(1).toLowerCase());
+}
+
+export default function AnalysisScreen() {
+  const insets = useSafeAreaInsets();
+  const { width: screenWidth } = useWindowDimensions();
+  const videoRef = useRef<Video>(null);
+  const {
+    audioMode, setAudioMode, gameMode, setGameMode,
+    zoomEnabled, setZoomEnabled,
+    setIsPlaying: setIsTempoPlaying,
+  } = useTempo();
+  const { activeSwing, activeOrigin, addSwing, updateSwing, setActive } = useSwingLibrary();
+  const perfectRatio = gameMode === "short" ? SHORT_GAME_RATIO : LONG_GAME_RATIO;
+
+  const [currentMs, setCurrentMs] = useState(0);
+  const [durationMs, setDurationMs] = useState(0);
+  const [videoAspect, setVideoAspect] = useState<number | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [previewPass, setPreviewPass] = useState<0 | 1 | 2 | 3>(0);
+  const [previewWord, setPreviewWord] = useState("");
+  const [marksConfirmed, setMarksConfirmed] = useState(false);
+  const [showControls, setShowControls] = useState(false);
+  const previewRef = useRef<PreviewState>({
+    active: false,
+    pass: 0,
+    fired: new Set(),
+    transitioning: false,
+  });
+  const impactZoomAnim = useRef(new Animated.Value(1)).current;
+  const zoomedRef = useRef(false);
+  // Last known (position, wall-clock-time, rate) sample from the video's own
+  // status callback. The bridge only reports position every ~33ms, which is
+  // what read as beep lag; interpolating position between samples lets the
+  // rAF loop below detect a marker crossing within a frame or two of it
+  // actually happening instead of waiting for the next bridge update.
+  const interpRef = useRef({ pos: 0, ts: Date.now(), rate: 0 });
+  // Set once our post-load "force seek to 0" call has actually resolved.
+  // Until then, any positionMillis the bridge reports (which on some
+  // devices arrives already a few frames into the clip, before our seek
+  // takes effect) is ignored in favor of a hard 0 — otherwise the frame
+  // counter/beeps can start from that leftover native starting position
+  // instead of a true frame 0.
+  const seekReadyRef = useRef(false);
+
+  const videoUri = activeSwing?.uri ?? null;
+  const marks: Markers = activeSwing?.markers ?? EMPTY_MARKERS;
+  const golferName = activeSwing?.golferName ?? "";
+
+  // "Being analyzed" = a swing video is loaded on this screen — counts
+  // toward the Profile tab's daily practice-time tracker.
+  useActiveTimeTracker(!!videoUri);
+
+  const setGolferName = (text: string) => {
+    if (!activeSwing) return;
+    updateSwing(activeOrigin, activeSwing.id, { golferName: text });
+  };
+
+  const currentFrame = Math.round(currentMs / MS_PER_FRAME);
+
+  // Reset transient playback state whenever the active swing changes.
+  useEffect(() => {
+    setCurrentMs(0);
+    setDurationMs(0);
+    setVideoAspect(null);
+    setIsPlaying(false);
+    setPreviewPass(0);
+    setPreviewWord("");
+    setMarksConfirmed(false);
+    setShowControls(false);
+    previewRef.current = { active: false, pass: 0, fired: new Set(), transitioning: false };
+    zoomedRef.current = false;
+    impactZoomAnim.setValue(1);
+    interpRef.current = { pos: 0, ts: Date.now(), rate: 0 };
+    seekReadyRef.current = false;
+  }, [activeSwing?.id]);
+
+  const pickVideo = async () => {
+    if (!(await canPickVideos())) {
+      Alert.alert(
+        "Permission Required",
+        "Please allow access to your photo library to import videos."
+      );
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["videos"],
+      // Lets the OS's own picker UI (trim handles on iOS) crop the clip
+      // before it's returned, instead of us building a trim tool in-app.
+      allowsEditing: true,
+      quality: 1,
+    });
+    if (!result.canceled && result.assets[0]) {
+      const origin = activeOrigin ?? "mine";
+      const uri = result.assets[0].uri;
+      const newSwing: Swing = {
+        id:      Date.now().toString(),
+        uri,
+        name:    `Swing ${Date.now()}`,
+        markers: EMPTY_MARKERS,
+      };
+      addSwing(origin, newSwing);
+      setActive(origin, newSwing.id);
+      generateThumbnail(uri).then((thumbnailUri) => {
+        if (thumbnailUri) updateSwing(origin, newSwing.id, { thumbnailUri });
+      });
+    }
+  };
+
+  const seekByFrames = async (frameDelta: number) => {
+    Haptics.selectionAsync();
+    const newMs = Math.max(
+      0,
+      Math.min(durationMs, currentMs + frameDelta * MS_PER_FRAME)
+    );
+    await videoRef.current?.setPositionAsync(newMs, {
+      toleranceMillisBefore: 0,
+      toleranceMillisAfter: 0,
+    });
+    setCurrentMs(newMs);
+  };
+
+  const markFrame = (mark: keyof Markers) => {
+    if (!activeSwing) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    updateSwing(activeOrigin, activeSwing.id, { markers: { ...marks, [mark]: currentMs } });
+  };
+
+  const clearMark = (mark: keyof Markers) => {
+    if (!activeSwing) return;
+    updateSwing(activeOrigin, activeSwing.id, { markers: { ...marks, [mark]: null } });
+  };
+
+  const setClub = (club: ShotCategory) => {
+    if (!activeSwing) return;
+    Haptics.selectionAsync();
+    updateSwing(activeOrigin, activeSwing.id, { club: activeSwing.club === club ? undefined : club });
+  };
+
+  const analysis = computeSwingAnalysis(marks, perfectRatio);
+
+  const finishAnalysis = () => {
+    if (!analysis || !activeSwing) return;
+    setMarksConfirmed(true);
+    incrementSwingsAnalyzed();
+    addSwingRecord({
+      swingId: activeSwing.id,
+      origin: activeOrigin,
+      golferName,
+      gameMode,
+      club: activeSwing.club ?? null,
+      ratio: analysis.ratio,
+      accuracy: analysis.accuracy,
+      thumbnailUri: activeSwing.thumbnailUri ?? null,
+    });
+  };
+
+  // Live frame counter: a single growing number during the backswing, then
+  // a backswing/downswing split that keeps counting through the downswing,
+  // freezing into the final ratio once impact is reached — mirrors the
+  // reference clip's counting badge instead of a static number.
+  const takeawayFrame = marks.takeaway !== null ? Math.round(marks.takeaway / MS_PER_FRAME) : null;
+  const topFrame = marks.top !== null ? Math.round(marks.top / MS_PER_FRAME) : null;
+  const impactFrame = marks.impact !== null ? Math.round(marks.impact / MS_PER_FRAME) : null;
+
+  let counterPhase: "hidden" | "back" | "down" | "done" = "hidden";
+  let backCount = 0;
+  let downCount = 0;
+
+  if (takeawayFrame !== null && currentFrame >= takeawayFrame) {
+    if (topFrame === null || currentFrame < topFrame) {
+      counterPhase = "back";
+      backCount = currentFrame - takeawayFrame;
+    } else {
+      backCount = topFrame - takeawayFrame;
+      if (impactFrame === null || currentFrame < impactFrame) {
+        counterPhase = "down";
+        downCount = currentFrame - topFrame;
+      } else {
+        counterPhase = "done";
+        downCount = impactFrame - topFrame;
+      }
+    }
+  }
+
+  // Docked (non-fullscreen) mode sizes the video box to the source's real
+  // aspect ratio instead of a fixed height, so there's no dead letterbox
+  // space for the frame counter/name caption/watermark to float in.
+  const handleReadyForDisplay = (event: { naturalSize?: { width: number; height: number } }) => {
+    const { width, height } = event.naturalSize ?? {};
+    if (width && height && width > 0 && height > 0) setVideoAspect(width / height);
+  };
+
+  const dockedVideoWidth = screenWidth - 40; // matches videoWrapper's marginHorizontal:20
+  const dockedVideoHeight = videoAspect
+    ? Math.min(Math.max(dockedVideoWidth / videoAspect, 180), 340)
+    : 240;
+
+  // Fires the takeaway/top/impact beep+haptic+caption the instant `pos`
+  // crosses each marker. Called both from the authoritative bridge callback
+  // and from the higher-frequency interpolation loop below, so whichever
+  // reaches the marker first wins — `pr.fired` guards against double-firing.
+  //
+  // Every restart-to-0 (initial preview start, each pass transition, stop)
+  // must go through this single helper. The earlier bug: interpRef/currentMs
+  // were force-reset to 0 in JS, but `seekReadyRef` — which gates whether
+  // handleStatus trusts a bridge-reported position at all — was only ever
+  // flipped false on a brand-new video *load*, never on a preview restart.
+  // So during the real async gap between "we reset state to 0" and "the
+  // setPositionAsync(0) bridge call actually lands", any status update that
+  // arrived in between (reporting wherever the player still physically was —
+  // e.g. frame 22 from the marking scrub, or the end of the previous pass)
+  // sailed straight through and overwrote our reset with that stale number.
+  // Gating seekReadyRef across the whole async span, the same way the
+  // initial-load path already did, closes that race for every restart path.
+  const seekToZeroAndResetClock = async () => {
+    seekReadyRef.current = false;
+    interpRef.current = { pos: 0, ts: Date.now(), rate: 0 };
+    setCurrentMs(0);
+    await videoRef.current?.setPositionAsync(0);
+    seekReadyRef.current = true;
+  };
+
+  // Slow-motion pass only: freeze on the marker frame exactly as its beep
+  // fires, then resume — play → reach marker → pause + beep → continue.
+  // Applies to all three markers (takeaway, top, impact), not just takeaway.
+  const pauseThenResumeIfSlowMo = () => {
+    if (previewRef.current.pass !== 3) return;
+    videoRef.current?.pauseAsync();
+    setTimeout(() => {
+      if (previewRef.current.active && previewRef.current.pass === 3) {
+        videoRef.current?.playAsync();
+      }
+    }, MARKER_PAUSE_MS);
+  };
+
+  const fireMarkerEvents = (pos: number) => {
+    const pr = previewRef.current;
+    if (!pr.active) return;
+
+    if (marks.takeaway !== null && !pr.fired.has("takeaway") && pos >= marks.takeaway) {
+      pr.fired.add("takeaway");
+      playStart(audioMode);
+      hapticTakeaway();
+      setPreviewWord(PHASE_WORDS.takeaway);
+      pauseThenResumeIfSlowMo();
+    }
+    if (marks.top !== null && !pr.fired.has("top") && pos >= marks.top) {
+      pr.fired.add("top");
+      playTop(audioMode);
+      hapticTop();
+      setPreviewWord(PHASE_WORDS.top);
+      pauseThenResumeIfSlowMo();
+    }
+    if (marks.impact !== null && !pr.fired.has("impact") && pos >= marks.impact) {
+      pr.fired.add("impact");
+      playImpact(audioMode);
+      hapticImpact();
+      setPreviewWord(PHASE_WORDS.impact);
+      pauseThenResumeIfSlowMo();
+    }
+  };
+
+  // Drives fireMarkerEvents off an interpolated position between bridge
+  // updates (see interpRef above), at animation-frame rate rather than the
+  // ~33ms bridge poll rate.
+  useEffect(() => {
+    let raf: ReturnType<typeof requestAnimationFrame>;
+    const loop = () => {
+      const pr = previewRef.current;
+      if (pr.active) {
+        const { pos, ts, rate } = interpRef.current;
+        const estPos = pos + (Date.now() - ts) * rate;
+        fireMarkerEvents(estPos);
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [marks.takeaway, marks.top, marks.impact, audioMode]);
+
+  const handleStatus = (status: AVPlaybackStatus) => {
+    if (!status.isLoaded) return;
+    // Until our post-load seek-to-0 has actually resolved, ignore whatever
+    // position the bridge reports — on some devices the first report or two
+    // arrives already a few frames into the clip, before our seek lands.
+    const pos = seekReadyRef.current ? (status.positionMillis ?? 0) : 0;
+    setCurrentMs(pos);
+    if (status.durationMillis) setDurationMs(status.durationMillis);
+    setIsPlaying(status.isPlaying);
+    interpRef.current = { pos, ts: Date.now(), rate: status.isPlaying ? (status.rate || 1) : 0 };
+
+    const pr = previewRef.current;
+    const end = status.durationMillis ?? durationMs;
+
+    if (pr.active) {
+      fireMarkerEvents(pos);
+
+      // Slow-motion impact zoom: only during the dedicated slow-mo pass
+      // (pass 3), ease into a tight zoom once we enter the impact window and
+      // hold it — the zoom should stay until the pass ends, not ease back
+      // out again once position moves past the marker.
+      if (zoomEnabled && pr.pass === 3 && marks.impact !== null) {
+        const shouldZoom = pos >= marks.impact - IMPACT_ZOOM_WINDOW_MS;
+        if (shouldZoom && !zoomedRef.current) {
+          zoomedRef.current = true;
+          Animated.timing(impactZoomAnim, {
+            toValue: IMPACT_ZOOM_SCALE,
+            duration: 220,
+            useNativeDriver: true,
+          }).start();
+        }
+      } else if (zoomedRef.current) {
+        zoomedRef.current = false;
+        Animated.timing(impactZoomAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+      }
+
+      if (!pr.transitioning && end > 0 && pos >= end) {
+        pr.transitioning = true;
+        const nextPass = pr.pass + 1;
+        if (nextPass > 3) {
+          pr.active = false;
+          setPreviewPass(0);
+          setPreviewWord("");
+          zoomedRef.current = false;
+          impactZoomAnim.setValue(1);
+          videoRef.current?.setRateAsync(1.0, true);
+          videoRef.current?.pauseAsync();
+          seekToZeroAndResetClock();
+        } else {
+          pr.pass = nextPass as 1 | 2 | 3;
+          pr.fired = new Set();
+          setPreviewPass(nextPass as 1 | 2 | 3);
+          setPreviewWord("");
+          seekToZeroAndResetClock().then(async () => {
+            if (nextPass === 3) await videoRef.current?.setRateAsync(0.6, true);
+            await videoRef.current?.playAsync();
+            pr.transitioning = false;
+          });
+        }
+      }
+    }
+  };
+
+  const startPreview = async () => {
+    if (!videoRef.current || !analysis) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    // Global media handoff: the tempo trainer may still be looping in the
+    // background (its state lives in TempoContext, not this screen) — stop
+    // it and cancel any in-flight voice cue before the video's own audio
+    // (playback + phase tones) starts, so the two streams never overlap.
+    setIsTempoPlaying(false);
+    stopAllAudio();
+    previewRef.current = { active: true, pass: 1, fired: new Set(), transitioning: false };
+    setPreviewPass(1);
+    setPreviewWord("");
+    setShowControls(false);
+    zoomedRef.current = false;
+    impactZoomAnim.setValue(1);
+    // Make sure every beep sound is actually loaded (WAV synthesized,
+    // written to disk, decoded into an Audio.Sound) before the clip starts
+    // moving. preloadSounds() was already fired at app boot, but on a fresh
+    // launch that load can still be in flight the first time Preview is
+    // tapped — this call resolves instantly once warm, and only blocks
+    // playback start on the genuinely-first, cold run.
+    await preloadSounds();
+    await videoRef.current.setRateAsync(1.0, true);
+    await seekToZeroAndResetClock();
+    await videoRef.current.playAsync();
+  };
+
+  const togglePreviewPlayback = async () => {
+    Haptics.selectionAsync();
+    if (isPlaying) await videoRef.current?.pauseAsync();
+    else await videoRef.current?.playAsync();
+  };
+
+  const stopPreview = async () => {
+    previewRef.current = { active: false, pass: 0, fired: new Set(), transitioning: false };
+    setPreviewPass(0);
+    setPreviewWord("");
+    setShowControls(false);
+    zoomedRef.current = false;
+    impactZoomAnim.setValue(1);
+    await videoRef.current?.setRateAsync(1.0, true);
+    await videoRef.current?.pauseAsync();
+    await seekToZeroAndResetClock();
+  };
+
+  // v1: share the original clip via the OS share sheet. Burning the tempo
+  // overlay/watermark into an actual re-encoded video file needs a native
+  // video-processing toolchain (ffmpeg-kit or similar) that Expo Go can't
+  // load — revisit once the app has a custom dev client.
+  const [isExporting, setIsExporting] = useState(false);
+  const handleExport = async () => {
+    if (!activeSwing || !analysis) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    if (Platform.OS === "web") {
+      Alert.alert("Not Available on Web", "Sharing isn't supported in the web preview — try this on your phone.");
+      return;
+    }
+    setIsExporting(true);
+    try {
+      const available = await Sharing.isAvailableAsync();
+      if (!available) {
+        Alert.alert("Not Available", "Sharing isn't available on this device.");
+        return;
+      }
+      await Sharing.shareAsync(activeSwing.uri, {
+        dialogTitle: "Share Your Swing",
+        mimeType: "video/mp4",
+      });
+    } catch (err) {
+      Alert.alert("Export Failed", err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const isMarking = !!videoUri && !marksConfirmed && previewPass === 0;
+  const isFullscreen = previewPass > 0 || isMarking;
+
+  return (
+    <View
+      style={[
+        styles.container,
+        {
+          paddingTop: insets.top + (Platform.OS === "web" ? 20 : 10),
+          paddingBottom: insets.bottom + (Platform.OS === "web" ? 84 : 60),
+        },
+      ]}
+    >
+      {!isFullscreen && (
+        <View style={styles.header}>
+          <Text style={styles.title}>ANALYSIS</Text>
+          <Text style={styles.subtitle}>Video Frame Counter</Text>
+        </View>
+      )}
+
+      {videoUri ? (
+        <View style={[styles.videoWrapper, isFullscreen && styles.videoWrapperFullscreen]}>
+          <Animated.View
+            style={[
+              !isFullscreen ? { width: "100%", height: dockedVideoHeight } : styles.videoFullscreen,
+              { transform: [{ scale: impactZoomAnim }] },
+            ]}
+          >
+          <Video
+            key={activeSwing?.id ?? "none"}
+            ref={videoRef}
+            source={{ uri: videoUri }}
+            style={styles.video}
+            resizeMode={ResizeMode.CONTAIN}
+            isLooping={false}
+            progressUpdateIntervalMillis={MS_PER_FRAME}
+            onLoad={() => seekToZeroAndResetClock()}
+            onPlaybackStatusUpdate={handleStatus}
+            onReadyForDisplay={handleReadyForDisplay}
+          />
+          </Animated.View>
+          {previewPass === 0 && (
+            <View style={styles.frameOverlay}>
+              <Text style={styles.frameCounter}>
+                Frame {currentFrame.toString().padStart(4, "0")}
+              </Text>
+              <Text style={styles.timecodeText}>
+                {(currentMs / 1000).toFixed(3)}s
+              </Text>
+            </View>
+          )}
+          {previewPass > 0 && (
+            <Pressable
+              style={StyleSheet.absoluteFillObject}
+              onPress={() => setShowControls((v) => !v)}
+            >
+              {showControls && (
+                <View style={styles.centerControlsOverlay} pointerEvents="box-none">
+                  <Pressable style={styles.centerPlayBtn} onPress={togglePreviewPlayback}>
+                    <Feather name={isPlaying ? "pause" : "play"} size={30} color="#FFF" />
+                  </Pressable>
+                </View>
+              )}
+            </Pressable>
+          )}
+          {previewPass > 0 && (
+            <Pressable style={styles.fullscreenCloseBtn} onPress={stopPreview}>
+              <Feather name="x" size={22} color="#FFF" />
+            </Pressable>
+          )}
+          <View style={styles.bottomLeftStack} pointerEvents="none">
+            {previewPass > 0 && (
+              <View style={styles.passBadge}>
+                <Text style={styles.passLabel}>
+                  {previewPass < 3 ? `PASS ${previewPass}/3` : "SLOW MOTION"}
+                </Text>
+              </View>
+            )}
+            {previewPass > 0 && golferName !== "" && (
+              <View style={styles.nameCaption}>
+                <Text style={styles.nameCaptionText}>{toTitleCase(golferName)}</Text>
+              </View>
+            )}
+          </View>
+          {previewWord !== "" && (
+            <View style={styles.phaseWordWrap} pointerEvents="none">
+              <Text style={styles.phaseWord}>{previewWord}</Text>
+            </View>
+          )}
+          {counterPhase !== "hidden" && (
+            <View style={styles.gradeOverlay} pointerEvents="none">
+              {counterPhase === "done" && analysis ? (
+                <>
+                  <View style={[styles.gradeOverlayPill, { backgroundColor: analysis.gradeColor + "26", borderColor: analysis.gradeColor + "55" }]}>
+                    <Text style={[styles.gradeOverlayGrade, { color: analysis.gradeColor }]}>
+                      {analysis.grade}
+                    </Text>
+                  </View>
+                  <Text style={styles.gradeOverlayPercent}>{analysis.accuracy}%</Text>
+                  <Text style={styles.gradeOverlayRatio}>{analysis.ratioStr}:1</Text>
+                </>
+              ) : counterPhase === "back" ? (
+                <Text style={[styles.counterNum, { color: BLUE }]}>{backCount}</Text>
+              ) : (
+                <View style={styles.counterSplitRow}>
+                  <Text style={[styles.counterNum, { color: BLUE }]}>{backCount}</Text>
+                  <Text style={styles.counterSlash}>/</Text>
+                  <Text style={[styles.counterNum, { color: RED }]}>{downCount}</Text>
+                </View>
+              )}
+            </View>
+          )}
+          <View style={styles.watermark} pointerEvents="none">
+            <Image source={require("../../assets/images/icon.png")} style={styles.watermarkIcon} />
+            <Text style={styles.watermarkTitle}>3to1 Golf</Text>
+            <Text style={styles.watermarkCta}>Download Free</Text>
+          </View>
+
+          {isMarking && (
+            <View style={styles.markingOverlay}>
+              <View style={styles.overlayScrubBar}>
+                <Pressable style={styles.overlayScrubBtn} onPress={() => seekByFrames(-10)}>
+                  <Feather name="chevrons-left" size={18} color="#CCC" />
+                </Pressable>
+                <Pressable style={styles.overlayScrubBtn} onPress={() => seekByFrames(-1)}>
+                  <Feather name="chevron-left" size={18} color="#FFF" />
+                </Pressable>
+                <Pressable
+                  style={styles.overlayPlayBtn}
+                  onPress={async () => {
+                    if (isPlaying) await videoRef.current?.pauseAsync();
+                    else await videoRef.current?.playAsync();
+                  }}
+                >
+                  <Feather name={isPlaying ? "pause" : "play"} size={20} color="#FFF" />
+                </Pressable>
+                <Pressable style={styles.overlayScrubBtn} onPress={() => seekByFrames(1)}>
+                  <Feather name="chevron-right" size={18} color="#FFF" />
+                </Pressable>
+                <Pressable style={styles.overlayScrubBtn} onPress={() => seekByFrames(10)}>
+                  <Feather name="chevrons-right" size={18} color="#CCC" />
+                </Pressable>
+              </View>
+
+              <View style={styles.overlayMarkRow}>
+                {(["takeaway", "top", "impact"] as const).map((mark) => {
+                  const labels = { takeaway: "TAKEAWAY", top: "TOP", impact: "IMPACT" };
+                  const colors = { takeaway: "#1A8CFF", top: "#FF9F0A", impact: "#FF3B30" };
+                  const val = marks[mark];
+                  return (
+                    <Pressable
+                      key={mark}
+                      style={[
+                        styles.overlayMarkBtn,
+                        { borderColor: val !== null ? colors[mark] : "#333333" },
+                      ]}
+                      onPress={() => (val !== null ? clearMark(mark) : markFrame(mark))}
+                    >
+                      <Text style={[styles.overlayMarkLabel, { color: val !== null ? colors[mark] : "#999" }]}>
+                        {labels[mark]}
+                      </Text>
+                      <Text style={styles.overlayMarkValue}>
+                        {val !== null ? `${Math.round(val / MS_PER_FRAME)}f` : "SET"}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
+              <Pressable
+                style={[styles.doneBtn, !analysis && styles.actionBtnDim]}
+                onPress={analysis ? finishAnalysis : undefined}
+              >
+                <Text style={styles.doneBtnLabel}>
+                  {analysis ? "Done" : "Set all 3 markers to continue"}
+                </Text>
+              </Pressable>
+            </View>
+          )}
+        </View>
+      ) : null}
+
+      {!isFullscreen && (
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.scrollContent}
+      >
+        {!videoUri ? (
+          <Pressable
+            onPress={pickVideo}
+            style={({ pressed }) => [
+              styles.importButton,
+              pressed && { opacity: 0.8 },
+            ]}
+          >
+            <MaterialCommunityIcons
+              name="video-plus"
+              size={40}
+              color="#1A8CFF"
+            />
+            <Text style={styles.importTitle}>Import Swing Video</Text>
+            <Text style={styles.importSubtitle}>
+              Select from your camera roll
+            </Text>
+          </Pressable>
+        ) : (
+          <>
+            <Pressable
+              style={styles.editMarkersBtn}
+              onPress={() => setMarksConfirmed(false)}
+            >
+              <Feather name="edit-2" size={13} color={BLUE} />
+              <Text style={styles.editMarkersText}>Edit Markers</Text>
+            </Pressable>
+
+            <View style={styles.marksSection}>
+              <Text style={styles.sectionLabel}>GOLFER NAME (OPTIONAL)</Text>
+              <TextInput
+                style={styles.nameInput}
+                value={golferName}
+                onChangeText={setGolferName}
+                placeholder="e.g. Jordan Spieth"
+                placeholderTextColor="#444444"
+              />
+            </View>
+
+            <View style={styles.marksSection}>
+              <Text style={styles.sectionLabel}>SWING TYPE</Text>
+              <View style={styles.audioModeGroup}>
+                {(["long", "short"] as const).map((m) => (
+                  <Pressable
+                    key={m}
+                    style={[styles.audioModeBtn, gameMode === m && styles.audioModeBtnActive]}
+                    onPress={() => { Haptics.selectionAsync(); setGameMode(m); }}
+                  >
+                    <Text style={[styles.audioModeLabel, gameMode === m && styles.audioModeLabelActive]}>
+                      {m === "long" ? "Long Game (3:1)" : "Short Game (2:1)"}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+
+            <View style={styles.marksSection}>
+              <Text style={styles.sectionLabel}>CLUB (OPTIONAL)</Text>
+              <View style={styles.clubChipRow}>
+                {CLUB_TAGS.map((tag) => {
+                  const active = activeSwing?.club === tag;
+                  return (
+                    <Pressable
+                      key={tag}
+                      style={[styles.clubChip, active && styles.clubChipActive]}
+                      onPress={() => setClub(tag)}
+                    >
+                      <Text style={[styles.clubChipLabel, active && styles.clubChipLabelActive]}>
+                        {CATEGORY_LABELS[tag]}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
+
+            {analysis ? (
+              <View style={styles.analysisCard}>
+                <View style={styles.analysisHeader}>
+                  <Text style={styles.sectionLabel}>SWING ANALYSIS</Text>
+                  <View
+                    style={[
+                      styles.gradeBadge,
+                      { backgroundColor: analysis.gradeColor + "22" },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.gradeText,
+                        { color: analysis.gradeColor },
+                      ]}
+                    >
+                      {analysis.grade}
+                    </Text>
+                  </View>
+                </View>
+
+                <View style={styles.accuracyRow}>
+                  <View
+                    style={[
+                      styles.scoreCircle,
+                      { borderColor: analysis.gradeColor + "55" },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.scoreNumber,
+                        { color: analysis.gradeColor },
+                      ]}
+                    >
+                      {analysis.accuracy}
+                    </Text>
+                    <Text style={styles.scoreUnit}>%</Text>
+                  </View>
+                  <View style={styles.statsGrid}>
+                    <View style={styles.statItem}>
+                      <Text style={styles.statLabel}>BACKSWING</Text>
+                      <Text style={styles.statValue}>
+                        {analysis.backswingFrames}f /{" "}
+                        {analysis.backswingMs.toFixed(0)}ms
+                      </Text>
+                    </View>
+                    <View style={styles.statItem}>
+                      <Text style={styles.statLabel}>DOWNSWING</Text>
+                      <Text style={styles.statValue}>
+                        {analysis.downswingFrames}f /{" "}
+                        {analysis.downswingMs.toFixed(0)}ms
+                      </Text>
+                    </View>
+                    <View style={styles.statItem}>
+                      <Text style={styles.statLabel}>YOUR RATIO</Text>
+                      <Text style={styles.statValue}>{analysis.ratioStr}:1</Text>
+                    </View>
+                    <View style={styles.statItem}>
+                      <Text style={styles.statLabel}>GOLD STANDARD</Text>
+                      <Text style={[styles.statValue, { color: "#FFD700" }]}>
+                        {perfectRatio.toFixed(2)}:1
+                      </Text>
+                    </View>
+                  </View>
+                </View>
+              </View>
+            ) : (
+              <View style={styles.hintCard}>
+                <MaterialCommunityIcons
+                  name="information-outline"
+                  size={18}
+                  color="#333333"
+                />
+                <Text style={styles.hintText}>
+                  Pause the video and set all three frame markers to calculate
+                  your swing ratio
+                </Text>
+              </View>
+            )}
+
+            <View style={styles.marksSection}>
+              <Text style={styles.sectionLabel}>PREVIEW AUDIO</Text>
+              <View style={styles.audioModeGroup}>
+                {(["tones", "piano", "voice"] as const).map((m) => (
+                  <Pressable
+                    key={m}
+                    style={[styles.audioModeBtn, audioMode === m && styles.audioModeBtnActive]}
+                    onPress={() => { Haptics.selectionAsync(); setAudioMode(m); }}
+                  >
+                    <Text style={[styles.audioModeLabel, audioMode === m && styles.audioModeLabelActive]}>
+                      {m === "tones" ? "Beeps" : m === "piano" ? "Piano" : "Voice"}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+
+            <View style={styles.marksSection}>
+              <View style={styles.zoomToggleRow}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.zoomToggleLabel}>Impact Zoom</Text>
+                  <Text style={styles.zoomToggleSubtext}>
+                    Zoom in during the slow-motion pass
+                  </Text>
+                </View>
+                <Switch
+                  value={zoomEnabled}
+                  onValueChange={(v) => { Haptics.selectionAsync(); setZoomEnabled(v); }}
+                  trackColor={{ false: "#1A1A1A", true: BLUE }}
+                  thumbColor="#FFFFFF"
+                />
+              </View>
+            </View>
+
+            <View style={styles.actionRow}>
+              <Pressable
+                style={[styles.actionBtn, !analysis && styles.actionBtnDim]}
+                onPress={analysis ? startPreview : undefined}
+              >
+                <Feather name="play-circle" size={20} color="#FFF" style={{ marginRight: 8 }} />
+                <Text style={styles.actionBtnLabel}>Preview</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.actionBtn, styles.actionBtnSecondary, (!analysis || isExporting) && styles.actionBtnDim]}
+                onPress={analysis && !isExporting ? handleExport : undefined}
+              >
+                {isExporting ? (
+                  <ActivityIndicator size="small" color={BLUE} style={{ marginRight: 8 }} />
+                ) : (
+                  <Feather name="download" size={20} color={BLUE} style={{ marginRight: 8 }} />
+                )}
+                <Text style={[styles.actionBtnLabel, { color: BLUE }]}>
+                  {isExporting ? "Sharing..." : "Export"}
+                </Text>
+              </Pressable>
+            </View>
+
+            {!analysis && (
+              <Text style={styles.allSetHint}>Set all 3 markers to enable Preview &amp; Export</Text>
+            )}
+
+            <Pressable
+              style={styles.reImportBtn}
+              onPress={pickVideo}
+            >
+              <Feather name="refresh-cw" size={14} color="#444444" />
+              <Text style={styles.reImportText}>Import Different Video</Text>
+            </Pressable>
+          </>
+        )}
+      </ScrollView>
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#000000" },
+  header: { paddingHorizontal: 24, marginBottom: 16 },
+  title: {
+    fontSize: 20,
+    fontWeight: "700",
+    color: "#FFFFFF",
+    letterSpacing: 3,
+    fontFamily: "Inter_700Bold",
+  },
+  subtitle: {
+    fontSize: 12,
+    color: "#444444",
+    marginTop: 2,
+    letterSpacing: 1,
+    fontFamily: "Inter_400Regular",
+  },
+  scrollContent: { paddingHorizontal: 20, paddingBottom: 20 },
+  importButton: {
+    borderWidth: 1.5,
+    borderColor: "#1A1A1A",
+    borderStyle: "dashed",
+    borderRadius: 20,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 56,
+    gap: 10,
+  },
+  importTitle: {
+    fontSize: 16,
+    color: "#CCCCCC",
+    fontWeight: "600",
+    fontFamily: "Inter_600SemiBold",
+  },
+  importSubtitle: {
+    fontSize: 12,
+    color: "#444444",
+    fontFamily: "Inter_400Regular",
+  },
+  videoWrapper: {
+    borderRadius: 14,
+    overflow: "hidden",
+    backgroundColor: "#0D0D0D",
+    marginBottom: 12,
+    marginHorizontal: 20,
+    position: "relative",
+  },
+  videoWrapperFullscreen: {
+    flex: 1,
+    borderRadius: 0,
+    marginBottom: 0,
+    marginHorizontal: 0,
+  },
+  video: { width: "100%", height: "100%" },
+  videoFullscreen: { width: "100%", height: "100%" },
+  centerControlsOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(0,0,0,0.25)",
+  },
+  centerPlayBtn: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderWidth: 1.5,
+    borderColor: "rgba(255,255,255,0.35)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  fullscreenCloseBtn: {
+    position: "absolute",
+    top: 10,
+    left: 12,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  frameOverlay: {
+    position: "absolute",
+    top: 10,
+    left: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  frameCounter: {
+    fontSize: 13,
+    color: "#1A8CFF",
+    fontWeight: "700",
+    fontFamily: "Inter_700Bold",
+    backgroundColor: "rgba(0,0,0,0.7)",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    letterSpacing: 1,
+  },
+  timecodeText: {
+    fontSize: 11,
+    color: "#888888",
+    fontFamily: "Inter_400Regular",
+    backgroundColor: "rgba(0,0,0,0.7)",
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 4,
+  },
+  bottomLeftStack: {
+    position: "absolute",
+    bottom: 8,
+    left: 12,
+    gap: 6,
+    alignItems: "flex-start",
+  },
+  passBadge: {
+    backgroundColor: "rgba(0,0,0,0.68)",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  passLabel: {
+    fontSize: 11,
+    fontFamily: "Inter_600SemiBold",
+    color: ORANGE,
+    letterSpacing: 1,
+  },
+  nameCaption: {
+    backgroundColor: "rgba(0,0,0,0.68)",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  nameCaptionText: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFFFFF",
+    letterSpacing: 0.3,
+  },
+  watermark: {
+    position: "absolute",
+    right: 12,
+    bottom: 8,
+    backgroundColor: "rgba(0,0,0,0.68)",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    alignItems: "center",
+  },
+  watermarkIcon: {
+    width: 20,
+    height: 20,
+    borderRadius: 5,
+    marginBottom: 3,
+  },
+  watermarkTitle: {
+    fontSize: 10,
+    fontFamily: "Inter_700Bold",
+    color: "#FFFFFF",
+    letterSpacing: 0.5,
+  },
+  watermarkCta: {
+    fontSize: 9,
+    fontFamily: "Inter_500Medium",
+    color: BLUE,
+    marginTop: 1,
+  },
+  markingOverlay: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "rgba(0,0,0,0.7)",
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 14,
+    gap: 12,
+  },
+  overlayScrubBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  overlayScrubBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: "rgba(255,255,255,0.1)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  overlayPlayBtn: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: BLUE,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  overlayMarkRow: { flexDirection: "row", gap: 8 },
+  overlayMarkBtn: {
+    flex: 1,
+    alignItems: "center",
+    gap: 2,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    backgroundColor: "rgba(255,255,255,0.06)",
+  },
+  overlayMarkLabel: {
+    fontSize: 10,
+    fontFamily: "Inter_600SemiBold",
+    letterSpacing: 0.5,
+  },
+  overlayMarkValue: {
+    fontSize: 12,
+    fontFamily: "Inter_700Bold",
+    color: "#FFFFFF",
+  },
+  doneBtn: {
+    backgroundColor: BLUE,
+    borderRadius: 12,
+    paddingVertical: 13,
+    alignItems: "center",
+  },
+  doneBtnLabel: {
+    fontSize: 15,
+    fontFamily: "Inter_700Bold",
+    color: "#FFFFFF",
+  },
+  phaseWordWrap: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 44,
+    alignItems: "center",
+  },
+  phaseWord: {
+    fontSize: 26,
+    fontFamily: "Inter_700Bold",
+    color: "#FFFFFF",
+    letterSpacing: 3,
+    textShadowColor: "rgba(0,0,0,0.8)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 8,
+  },
+  gradeOverlay: {
+    position: "absolute",
+    top: 10,
+    right: 12,
+    backgroundColor: "rgba(0,0,0,0.68)",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  gradeOverlayPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: 6,
+    borderWidth: 1,
+    marginBottom: 4,
+  },
+  gradeOverlayGrade: {
+    fontSize: 11,
+    fontFamily: "Inter_700Bold",
+    letterSpacing: 2,
+  },
+  gradeOverlayPercent: {
+    fontSize: 22,
+    fontFamily: "Inter_700Bold",
+    color: "#FFFFFF",
+    letterSpacing: -0.5,
+  },
+  gradeOverlayRatio: {
+    fontSize: 11,
+    fontFamily: "Inter_500Medium",
+    color: "#999999",
+    letterSpacing: 0.5,
+    marginTop: 3,
+  },
+  counterNum: {
+    fontSize: 22,
+    fontFamily: "Inter_700Bold",
+    letterSpacing: -0.5,
+  },
+  counterSplitRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 4,
+  },
+  counterSlash: {
+    fontSize: 16,
+    fontFamily: "Inter_600SemiBold",
+    color: "#555555",
+  },
+  nameInput: {
+    backgroundColor: "#0D0D0D",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#1A1A1A",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 14,
+    fontFamily: "Inter_500Medium",
+    color: "#FFFFFF",
+  },
+  audioModeGroup: {
+    flexDirection: "row",
+    backgroundColor: "#0D0D0D",
+    borderRadius: 10,
+    padding: 3,
+    borderWidth: 1,
+    borderColor: "#1A1A1A",
+  },
+  audioModeBtn: {
+    flex: 1,
+    paddingVertical: 9,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  audioModeBtnActive: { backgroundColor: BLUE },
+  audioModeLabel: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+    color: "#555555",
+  },
+  audioModeLabelActive: { color: "#FFFFFF" },
+  zoomToggleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#0D0D0D",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#1A1A1A",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 12,
+  },
+  zoomToggleLabel: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: "#CCCCCC",
+  },
+  zoomToggleSubtext: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: "#444444",
+    marginTop: 2,
+  },
+  clubChipRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  clubChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: "#0D0D0D",
+    borderWidth: 1,
+    borderColor: "#1A1A1A",
+  },
+  clubChipActive: { backgroundColor: BLUE + "22", borderColor: BLUE },
+  clubChipLabel: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: "#555555" },
+  clubChipLabelActive: { color: BLUE },
+  marksSection: { marginBottom: 20 },
+  sectionLabel: {
+    fontSize: 10,
+    color: "#444444",
+    letterSpacing: 2,
+    fontWeight: "600",
+    marginBottom: 10,
+    fontFamily: "Inter_600SemiBold",
+  },
+  editMarkersBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: BLUE + "18",
+    borderWidth: 1,
+    borderColor: BLUE + "44",
+    borderRadius: 10,
+    paddingVertical: 10,
+    marginBottom: 16,
+  },
+  editMarkersText: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+    color: BLUE,
+  },
+  analysisCard: {
+    backgroundColor: "#0D0D0D",
+    borderRadius: 16,
+    padding: 18,
+    gap: 16,
+    borderWidth: 1,
+    borderColor: "#1A1A1A",
+    marginBottom: 16,
+  },
+  analysisHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  gradeBadge: {
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 8,
+  },
+  gradeText: {
+    fontSize: 11,
+    fontWeight: "700",
+    letterSpacing: 2,
+    fontFamily: "Inter_700Bold",
+  },
+  accuracyRow: { flexDirection: "row", alignItems: "center", gap: 18 },
+  scoreCircle: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: "#161616",
+    justifyContent: "center",
+    borderWidth: 1.5,
+    flexDirection: "row",
+    alignItems: "baseline" as const,
+    gap: 0,
+  },
+  scoreNumber: {
+    fontSize: 28,
+    fontWeight: "700",
+    fontFamily: "Inter_700Bold",
+  },
+  scoreUnit: {
+    fontSize: 14,
+    color: "#666666",
+    fontFamily: "Inter_400Regular",
+  },
+  statsGrid: {
+    flex: 1,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    rowGap: 14,
+    columnGap: 10,
+  },
+  statItem: { width: "47%", gap: 5 },
+  statLabel: {
+    fontSize: 8,
+    color: "#444444",
+    letterSpacing: 1.5,
+    fontFamily: "Inter_600SemiBold",
+    fontWeight: "600",
+  },
+  statValue: {
+    fontSize: 13,
+    color: "#CCCCCC",
+    fontWeight: "600",
+    fontFamily: "Inter_600SemiBold",
+    lineHeight: 16,
+  },
+  hintCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: "#0D0D0D",
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "#1A1A1A",
+    marginBottom: 16,
+  },
+  hintText: {
+    flex: 1,
+    fontSize: 12,
+    color: "#444444",
+    lineHeight: 18,
+    fontFamily: "Inter_400Regular",
+  },
+  actionRow: { flexDirection: "row", gap: 10, marginBottom: 16 },
+  actionBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: BLUE,
+    borderRadius: 16,
+    paddingVertical: 16,
+  },
+  actionBtnDim: { opacity: 0.4 },
+  actionBtnSecondary: { backgroundColor: BLUE + "18", borderWidth: 1, borderColor: BLUE + "44" },
+  actionBtnStop: { backgroundColor: RED + "22", borderWidth: 1, borderColor: RED + "44", marginBottom: 16 },
+  actionBtnLabel: { fontSize: 16, fontFamily: "Inter_700Bold", color: "#FFF" },
+  allSetHint: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: "#333",
+    textAlign: "center",
+    marginBottom: 16,
+  },
+  reImportBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    paddingVertical: 12,
+  },
+  reImportText: {
+    fontSize: 13,
+    color: "#444444",
+    fontFamily: "Inter_400Regular",
+  },
+});

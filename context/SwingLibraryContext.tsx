@@ -1,0 +1,98 @@
+import React, { createContext, useCallback, useContext, useState } from "react";
+
+import type { ShotCategory } from "@/data/tempoPlayers";
+
+export interface Markers {
+  takeaway: number | null;
+  top: number | null;
+  impact: number | null;
+}
+
+export const EMPTY_MARKERS: Markers = { takeaway: null, top: null, impact: null };
+
+export interface Swing {
+  id: string;
+  uri: string;
+  name: string;
+  markers: Markers;
+  /** Optional caption shown over the video, e.g. the golfer's name. */
+  golferName?: string;
+  /** Club/shot type this swing was tagged with, for per-club tempo stats. */
+  club?: ShotCategory;
+  /** Local frame-capture thumbnail (native only — see utils/thumbnails.ts). */
+  thumbnailUri?: string;
+}
+
+export type SwingOrigin = "mine" | "pro";
+
+interface SwingLibraryContextValue {
+  swings: Swing[];
+  proSwings: Swing[];
+  addSwing: (origin: SwingOrigin, swing: Swing) => void;
+  updateSwing: (origin: SwingOrigin, id: string, patch: Partial<Swing>) => void;
+  activeId: string | null;
+  activeOrigin: SwingOrigin;
+  setActive: (origin: SwingOrigin, id: string | null) => void;
+  activeSwing: Swing | null;
+  findSwing: (origin: SwingOrigin, id: string) => Swing | null;
+}
+
+const SwingLibraryContext = createContext<SwingLibraryContextValue | null>(null);
+
+export function SwingLibraryProvider({ children }: { children: React.ReactNode }) {
+  const [swings, setSwings] = useState<Swing[]>([]);
+  const [proSwings, setProSwings] = useState<Swing[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [activeOrigin, setActiveOrigin] = useState<SwingOrigin>("mine");
+
+  const addSwing = useCallback((origin: SwingOrigin, swing: Swing) => {
+    const setList = origin === "mine" ? setSwings : setProSwings;
+    setList((prev) => [swing, ...prev]);
+  }, []);
+
+  const updateSwing = useCallback(
+    (origin: SwingOrigin, id: string, patch: Partial<Swing>) => {
+      const setList = origin === "mine" ? setSwings : setProSwings;
+      setList((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+    },
+    [],
+  );
+
+  const setActive = useCallback((origin: SwingOrigin, id: string | null) => {
+    setActiveOrigin(origin);
+    setActiveId(id);
+  }, []);
+
+  const activeSwing =
+    (activeOrigin === "mine" ? swings : proSwings).find((s) => s.id === activeId) ?? null;
+
+  const findSwing = useCallback(
+    (origin: SwingOrigin, id: string): Swing | null =>
+      (origin === "mine" ? swings : proSwings).find((s) => s.id === id) ?? null,
+    [swings, proSwings],
+  );
+
+  return (
+    <SwingLibraryContext.Provider
+      value={{
+        swings,
+        proSwings,
+        addSwing,
+        updateSwing,
+        activeId,
+        activeOrigin,
+        setActive,
+        activeSwing,
+        findSwing,
+      }}
+    >
+      {children}
+    </SwingLibraryContext.Provider>
+  );
+}
+
+export function useSwingLibrary() {
+  const ctx = useContext(SwingLibraryContext);
+  if (!ctx) throw new Error("useSwingLibrary must be used inside SwingLibraryProvider");
+  return ctx;
+}
