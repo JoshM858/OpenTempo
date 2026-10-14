@@ -57,6 +57,9 @@ const head = `
   `;
 html = html.replace("</head>", `${head}</head>`);
 write("index.html", html);
+// GitHub Pages: serve the app for unknown paths (404.html) and skip Jekyll (it would drop _expo/).
+write("404.html", html);
+write(".nojekyll", "");
 
 // 3. service worker
 const entry = html.match(/src="(\/_expo\/static\/js\/web\/[^"]+\.js)"/)?.[1];

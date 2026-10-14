@@ -49,7 +49,16 @@ It then launches fullscreen like a native app and loads offline after the first 
 Browsers can't do some things the native app does: no haptics, no frame thumbnails on swing cards, and the
 Export button uses the browser share sheet where available. Audio starts after the first tap (browser rule).
 
-## Deploy to Cloudflare (Workers static assets)
+## Deploy to GitHub Pages (current setup)
+
+`.github/workflows/pages.yml` builds the app and publishes `dist/` on every push. One-time setup in the repo:
+**Settings -> Pages -> Build and deployment -> Source: GitHub Actions** (NOT "Deploy from a branch" - that publishes
+this README instead of the app). Custom domain: **Settings -> Pages -> Custom domain -> 548987.xyz**, with a DNS
+record at your registrar (apex: A records to 185.199.108.153 / .109.153 / .110.153 / .111.153; subdomain: CNAME to
+`joshm858.github.io`), then tick *Enforce HTTPS*. `public/CNAME` ships the domain with every build.
+Optional API: add a repo variable `EXPO_PUBLIC_API_URL` (Settings -> Secrets and variables -> Actions -> Variables).
+
+## Alternative: Cloudflare (Workers static assets)
 
 Config lives in `wrangler.toml` (serves `dist/` with an SPA fallback) and `public/_headers` (cache rules).
 
